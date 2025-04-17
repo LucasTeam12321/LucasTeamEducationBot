@@ -38,6 +38,8 @@ def init_db():
     conn.commit()
     conn.close()
 
+init_db() # <--- Вызываем init_db() здесь, сразу после определения функции
+
 # Словарь для сопоставления предметов
 SUBJECT_MAP = {
     "Математика": "math",
@@ -75,53 +77,63 @@ def create_options_keyboard(options):
 
 # Функция для получения вопроса из базы данных
 def get_question(subject_key, user_id):
-    try: # Начинаем блок обработки исключений (ошибок)
-        conn = sqlite3.connect('quiz.db') # Подключаемся к базе данных
-        cursor = conn.cursor() # Создаем курсор для выполнения запросов
+    try:
+        conn = sqlite3.connect('quiz.db')
+        cursor = conn.cursor()
 
-        # Получаем вопрос с учетом класса игрока
-        cursor.execute('''
-            SELECT id, question, correct_answer, options, difficulty
-            FROM questions
-            WHERE subject = ?
-            AND difficulty BETWEEN
-                (SELECT MAX(1.0, rating - 1.0) FROM players WHERE user_id = ?)
-                AND (SELECT MIN(11.0, rating + 1.0) FROM players WHERE user_id = ?)
-            ORDER BY RANDOM()
-            LIMIT 1
-        ''', (subject_key, user_id, user_id))
-        questions = cursor.fetchall()
+        # Получаем класс игрока. Обрабатываем случай, если игрок не найден
+        cursor.execute("SELECT grade FROM players WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        if not result:
+            logging.error(f"Игрок с user_id {user_id} не найден в базе данных.")
+            return None
+        player_grade = result[0]
 
-        if questions: # Проверяем, есть ли вопросы по заданному предмету
-            # Выбираем случайный вопрос из списка
-            random_question = questions[0]
-            question_id, question, correct_answer, options_str, question_difficulty = random_question
+        min_difficulty = max(1, int(player_grade - 1))
+        max_difficulty = min(11, int(player_grade + 1))
 
-            try:  # Пытаемся преобразовать строку с вариантами ответов из JSON формата в список
+        # Запрос вопроса с учетом сложности
+        cursor.execute(
+            "SELECT question, correct_answer, options, explanation, link, difficulty "  # Добавили explanation и link
+            "FROM questions "
+            "WHERE subject = ? AND difficulty BETWEEN ? AND ? "
+            "ORDER BY RANDOM() LIMIT 1",
+            (subject_key, min_difficulty, max_difficulty)
+        )
+        question_data = cursor.fetchone()
+
+        if question_data:
+            question, correct_answer, options_str, explanation, link, difficulty = question_data  # Распаковка с explanation и link
+
+            try:
                 options = json.loads(options_str)
-            except json.JSONDecodeError: # Если преобразование не удалось (не JSON формат)
-                # Разделяем строку с вариантами ответов по запятой
+            except json.JSONDecodeError:
                 options = options_str.split(',')
-                options = [opt.strip() for opt in options] # Удаляем лишние пробелы из каждого варианта ответа
+                options = [opt.strip() for opt in options]
 
-            if correct_answer not in options: # Если правильного ответа нет среди вариантов
-                options.append(correct_answer) # Добавляем правильный ответ к вариантам
+            if correct_answer not in options:
+                options.append(correct_answer)
 
-            random.shuffle(options) # Перемешиваем варианты ответов случайным образом
-            return { # Возвращаем словарь с вопросом, правильным ответом и вариантами ответов
+            random.shuffle(options)
+            return {
                 "question": question,
                 "correct_answer": correct_answer,
-                "options": options
+                "options": options,
+                "explanation": explanation,  # Добавили explanation в возвращаемый словарь
+                "link": link,  # Добавили link в возвращаемый словарь
+                "difficulty": difficulty
             }
-        else: # Если вопросов по заданному предмету нет
-            return None # Возвращаем None
+        else:
+            return None
 
-    except sqlite3.Error as e: # Обрабатываем ошибки базы данных
-        logging.error(f"Ошибка БД в get_question: {e}") # Записываем ошибку в лог
-        return None # Возвращаем None
-    finally: # Этот блок выполняется всегда, даже если возникли ошибки
-        if conn: # Если подключение к базе данных установлено
-            conn.close() # Закрываем подключение
+    except sqlite3.Error as e:
+        logging.error(f"Ошибка БД в get_question: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
 
 
 # Обработчик команды /start - выполняется, когда пользователь отправляет команду /start
@@ -130,41 +142,26 @@ def start(msg):
     user_id = msg.from_user.id
     username = msg.from_user.username
     try:
-        init_db()  # Инициализируем БД при старте
         conn = sqlite3.connect('quiz.db')
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO players (user_id, username)
-            VALUES (?, ?)
-        ''', (user_id, username))
-        conn.commit() # Сохраняем изменения в базе данных
-        # Отправляем приветственное сообщение с главной клавиатурой
+            INSERT OR IGNORE INTO players (user_id, username, grade) 
+            VALUES (?, ?, ?)
+        ''', (user_id, username, 5.0))  # Дефолтный grade = 5.0
+        conn.commit()
+
         with open("Картинка_start.jpg", 'rb') as photo:
             bot.send_photo(msg.chat.id, photo)
-        bot.send_message(msg.chat.id, "🎉 Приветствую тебя в LucasTeamEducationBot! \n Здесь ты можешь сыграть в такие игры как: \n 🔹Виселица\n 🔹Математический бой\n 🔹Верю - не верю\n  Также ты можешь сыграть в викторину на одну из тем на выбор:\n  🔸Математика\n  🔸История\n  🔸Литература\n Для подробной информации об играх используй /help. \n Чтобы начать играть в викторину используй /quiz.\n Чтобы начать игру используй /minigame .", reply_markup=create_main_keyboard())
-    except sqlite3.Error as e: # Обрабатываем ошибки базы данных
-        logging.error(f"Ошибка БД при старте: {e}") # Записываем ошибку в лог
-    finally: # Этот блок выполняется всегда
-        if conn: # Если подключение к базе данных установлено
-            conn.close() # Закрываем подключение
-    user_id = msg.from_user.id
-    username = msg.from_user.username
-    try:
-        init_db()  # Инициализируем БД при старте
-        conn = sqlite3.connect('quiz.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR IGNORE INTO players (user_id, username)
-            VALUES (?, ?)
-        ''', (user_id, username))
-        conn.commit() # Сохраняем изменения в базе данных
-        # Отправляем приветственное сообщение с главной клавиатурой
-        bot.send_message(msg.chat.id, "🎉 Добро пожаловать! Используйте /quiz для старта", reply_markup=create_main_keyboard())
-    except sqlite3.Error as e: # Обрабатываем ошибки базы данных
-        logging.error(f"Ошибка БД при старте: {e}") # Записываем ошибку в лог
-    finally: # Этот блок выполняется всегда
-        if conn: # Если подключение к базе данных установлено
-            conn.close() # Закрываем подключение
+        bot.send_message(msg.chat.id, "🎉 ... (приветственное сообщение) ...", reply_markup=create_main_keyboard())
+
+        bot.send_message(msg.chat.id, "🎉 Добро пожаловать! Используйте /quiz для старта", reply_markup=create_main_keyboard()) # Дополнительное сообщение
+
+    except sqlite3.Error as e:
+        logging.error(f"Ошибка БД при старте: {e}")
+    finally:
+        if conn:
+            conn.close()
+
 
 @bot.message_handler(commands=["help"])
 def help(msg):
@@ -211,58 +208,60 @@ def start_quiz(msg):
     bot.set_state(msg.from_user.id, QuizStates.choose_subject, msg.chat.id)
 
 
-@bot.message_handler(state=QuizStates.choose_subject) # Обработчик выбора предмета - выполняется, когда пользователь находится в состоянии выбора предмета
+@bot.message_handler(state=QuizStates.choose_subject)
 def handle_subject_selection(msg: Message):
-    if msg.text.strip() == "🚪 Выход":  # Если пользователь нажал кнопку "Выход"
-        bot.delete_state(msg.from_user.id, msg.chat.id) # Сбрасываем состояние
-        bot.send_message(msg.chat.id, "🔙 Возврат в главное меню", reply_markup=create_main_keyboard()) # Возвращаемся в главное меню
-        return # Прерываем выполнение функции
+    if msg.text.strip() == "🚪 Выход":
+        bot.delete_state(msg.from_user.id, msg.chat.id)
+        bot.send_message(msg.chat.id, "🔙 Возврат в главное меню",
+                         reply_markup=create_main_keyboard())
+        return
 
+    subject_key = SUBJECT_MAP.get(msg.text)
+    if not subject_key:
+        bot.send_message(msg.chat.id, "❌ Выберите предмет из списка!",
+                         reply_markup=create_subject_keyboard())
+        return
 
-    subject_key = SUBJECT_MAP.get(msg.text) # Получаем ключ предмета из словаря SUBJECT_MAP
-    if not subject_key: # Если ключ не найден (пользователь ввел неверный предмет)
-        bot.send_message(msg.chat.id, "❌ Выберите предмет из списка!", reply_markup=create_subject_keyboard()) # Просим выбрать предмет из списка
-        return # Прерываем выполнение функции
-
-    try: # Начинаем блок обработки исключений
-        conn = sqlite3.connect('quiz.db') # Подключаемся к базе данных
-        cursor = conn.cursor() # Создаем курсор
-
-        # Проверяем, есть ли вопросы по выбранному предмету
-        cursor.execute('SELECT COUNT(*) FROM questions WHERE subject = ?', (subject_key,))
-        count = cursor.fetchone()[0] # Получаем количество вопросов
-        if count == 0: # Если вопросов нет
-            bot.send_message(msg.chat.id, "⚠️ Вопросы временно отсутствуют", reply_markup=create_main_keyboard()) # Сообщаем об отсутствии вопросов
-            bot.delete_state(msg.from_user.id, msg.chat.id) # Сбрасываем состояние
-            return # Прерываем выполнение функции
+    try:
+        conn = sqlite3.connect('quiz.db')
+        cursor = conn.cursor()
 
         user_id = msg.from_user.id
-        # Получаем рейтинг игрока
-        cursor.execute('SELECT rating FROM players WHERE user_id = ?', (user_id,))
-        player_rating = cursor.fetchone()[0]
-        
-        question = get_question(subject_key, user_id) # Получаем вопрос с учетом рейтинга
-        if not question: # Если вопрос не найден
-            raise ValueError("Ошибка загрузки вопроса") # Вызываем исключение
 
-        markup = ReplyKeyboardMarkup(resize_keyboard=True) # Создаем клавиатуру с вариантами ответа
-        for option in question['options']: # Перебираем варианты ответа
-            markup.add(KeyboardButton(option)) # Добавляем кнопку для каждого варианта
+        # Получаем класс игрока из базы данных (ИСПРАВЛЕНО)
+        cursor.execute("SELECT grade FROM players WHERE user_id = ?", (user_id,))
+        player_grade = cursor.fetchone()[0]
 
-        with bot.retrieve_data(msg.from_user.id, msg.chat.id) as data: # Получаем данные о пользователе
-            data["correct_answer"] = question['correct_answer'] # Сохраняем правильный ответ
-            data["subject"] = subject_key # Сохраняем выбранный предмет
+        question = get_question(subject_key, player_grade)
+        if not question:
+            bot.send_message(msg.chat.id, "⚠️ Вопросы временно отсутствуют для вашего класса",
+                             reply_markup=create_main_keyboard())
+            bot.delete_state(msg.from_user.id, msg.chat.id)
+            return
 
-        bot.send_message(msg.chat.id, question['question'], reply_markup=markup) # Отправляем вопрос с клавиатурой вариантов ответа
-        bot.set_state(msg.from_user.id, QuizStates.answer, msg.chat.id) # Устанавливаем состояние пользователя в "ответ на вопрос"
+        markup = ReplyKeyboardMarkup(resize_keyboard=True)
+        for option in question['options']:
+            markup.add(KeyboardButton(option))
 
-    except (sqlite3.Error, ValueError) as e: # Обрабатываем ошибки
-        logging.error(f"Ошибка: {e}", exc_info=True) # Записываем ошибку в лог
-        bot.send_message(msg.chat.id, "❌ Системная ошибка", reply_markup=create_main_keyboard()) # Сообщаем об ошибке
-        bot.delete_state(msg.from_user.id, msg.chat.id) # Сбрасываем состояние
-    finally: # Выполняется всегда
-        if conn: # Если подключение установлено
-            conn.close() # Закрываем подключение
+        with bot.retrieve_data(msg.from_user.id, msg.chat.id) as data:
+            data["correct_answer"] = question['correct_answer']
+            data["subject"] = subject_key
+            data["question_difficulty"] = question["difficulty"]
+            data["explanation"] = question["explanation"]
+            data["link"] = question["link"]
+
+        bot.send_message(msg.chat.id, question['question'], reply_markup=markup)
+        bot.set_state(msg.from_user.id, QuizStates.answer, msg.chat.id)
+
+    except (sqlite3.Error, ValueError) as e:
+        logging.error(f"Ошибка: {e}", exc_info=True)
+        bot.send_message(msg.chat.id, "❌ Системная ошибка",
+                         reply_markup=create_main_keyboard())
+        bot.delete_state(msg.from_user.id, msg.chat.id)
+    finally:
+        if conn:
+            conn.close()
+
 
 
 @bot.message_handler(state=QuizStates.answer) # Обработчик ответа на вопрос - выполняется, когда пользователь находится в состоянии ответа на вопрос
@@ -353,4 +352,11 @@ def show_score(msg):
 
 
 bot.add_custom_filter(custom_filters.StateFilter(bot)) # Добавляем фильтр состояний
-bot.infinity_polling(timeout=30, long_polling_timeout=30) # Запускаем бота
+if __name__ == "__main__":
+    init_db()  # Вызов функции инициализации БД
+    try:
+        bot.remove_webhook()
+        bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    except Exception as e:
+        logging.error(f"Ошибка при запуске бота: {e}")
+

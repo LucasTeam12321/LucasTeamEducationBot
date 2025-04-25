@@ -1,418 +1,473 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from random import choice, randint
 import sqlite3
-import logging
-import random
-import json
-from werkzeug.security import generate_password_hash, check_password_hash
+import telebot
+from telebot import custom_filters
+from telebot.states import StatesGroup, State
+from telebot.storage import StateMemoryStorage
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, Message
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Конфигурация
+API_TOKEN = '7748202816:AAGhyNGFDAp940tEW_Bo4okMzopmYQKoQmM'
 
-app = Flask(__name__)
-app.secret_key = 'your_secret_key_here'  # Замените на реальный секретный ключ
+# Глобальная переменная для хранения состояния игры
+user_data = {}
 
-# Словарь предметов
-SUBJECT_MAP = {
-    "Математика": "math",
-    "История": "history",
-    "Литература": "literature",
-}
+# Инициализация бота
+state_storage = StateMemoryStorage()
+bot = telebot.TeleBot(API_TOKEN, state_storage=state_storage, use_class_middlewares=True)
 
-# Инициализация базы данных
-def init_db():
+
+# Определение состояний
+class QuizStates(StatesGroup):
+    question = State()
+    answer = State()
+    guess_number = State()  # Новое состояние для игры "Угадай число"
+
+
+# Функция для создания основной клавиатуры
+def create_main_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    # Первая строка: /score и /leaderboard
+    markup.row(KeyboardButton('/score'), KeyboardButton('/leaderboard'))
+    # Вторая строка: /quiz
+    markup.row(KeyboardButton('/quiz'))
+    markup.row(KeyboardButton('/minigame1'), KeyboardButton('/minigame2'))  # Добавляем обе мини-игры
+    return markup
+
+
+# Функция для создания клавиатуры с вариантами ответов
+def create_options_keyboard(options):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for option in options:
+        markup.add(KeyboardButton(option))
+    return markup
+
+
+# Функция для создания клавиатуры с кнопками для игры
+def create_tic_tac_toe_keyboard():
+    cmds_keyboard = ReplyKeyboardMarkup()
+    cmds_keyboard.row(KeyboardButton("0 0"), KeyboardButton("0 1"), KeyboardButton("0 2"))
+    cmds_keyboard.row(KeyboardButton("1 0"), KeyboardButton("1 1"), KeyboardButton("1 2"))
+    cmds_keyboard.row(KeyboardButton("2 0"), KeyboardButton("2 1"), KeyboardButton("2 2"))
+    cmds_keyboard.add(KeyboardButton("/stop"))
+    return cmds_keyboard
+
+
+# Функция для получения случайного вопроса из базы данных
+def get_random_question():
     conn = sqlite3.connect('quiz.db')
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS players (
-            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            password TEXT,
-            correct_answers INTEGER DEFAULT 0,
-            incorrect_answers INTEGER DEFAULT 0,
-            grade REAL DEFAULT 5.0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            question TEXT,
-            options TEXT,
-            correct_answer TEXT,
-            subject TEXT,
-            difficulty INTEGER,
-            explanation TEXT,
-            link TEXT
-        )
-    ''')
+
+    cursor.execute('SELECT question, options, correct_answer FROM questions ORDER BY RANDOM() LIMIT 1')
+    row = cursor.fetchone()
+
+    conn.close()
+
+    if row:
+        question, options_str, correct_answer = row
+        options = options_str.split(',')  # Преобразуем строку в список
+        return {
+            "question": question,
+            "options": options,
+            "correct_answer": correct_answer
+        }
+    return None
+
+
+# Функция для получения статистики игрока
+def get_player_stats(user_id):
+    conn = sqlite3.connect('quiz.db')
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT correct_answers, incorrect_answers, score, minigames_played FROM players WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+
+    conn.close()
+
+    if row:
+        return {
+            "correct_answers": row[0],
+            "incorrect_answers": row[1],
+            "score": row[2],
+            "minigames_played": row[3]
+        }
+    return {
+        "correct_answers": 0,
+        "incorrect_answers": 0,
+        "score": 0,
+        "minigames_played": 0
+    }
+
+
+# Функция для обновления статистики игрока
+def update_player_stats(user_id, username=None, correct_answers=0, incorrect_answers=0, score=0, minigames_played=0):
+    conn = sqlite3.connect('quiz.db')
+    cursor = conn.cursor()
+
+    # Проверяем, существует ли игрок в базе данных
+    cursor.execute('SELECT user_id FROM players WHERE user_id = ?', (user_id,))
+    if cursor.fetchone():
+        # Обновляем существующую запись
+        cursor.execute('''
+            UPDATE players
+            SET correct_answers = correct_answers + ?,
+                incorrect_answers = incorrect_answers + ?,
+                score = score + ?,
+                minigames_played = minigames_played + ?
+            WHERE user_id = ?
+        ''', (correct_answers, incorrect_answers, score, minigames_played, user_id))
+    else:
+        # Создаем новую запись
+        cursor.execute('''
+            INSERT INTO players (user_id, username, correct_answers, incorrect_answers, score, minigames_played)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, correct_answers, incorrect_answers, score, minigames_played))
+
     conn.commit()
     conn.close()
 
-# Функция для создания клавиатур (теперь это будут кнопки в HTML)
-def get_subjects():
-    return list(SUBJECT_MAP.keys())
 
-# Функция для получения вопроса
-def get_question(subject_key, user_id):
-    try:
-        conn = sqlite3.connect('quiz.db')
-        cursor = conn.cursor()
-        print(f"User ID in get_question: {user_id}")  # Отладочная печать user_id
+# Функция для получения топа игроков
+def get_leaderboard():
+    conn = sqlite3.connect('quiz.db')
+    cursor = conn.cursor()
 
-        cursor.execute("SELECT grade FROM players WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-        logging.info(f"Результат запроса для user_id {user_id}: {result}")
+    # Выбираем топ-10 игроков по количеству правильных ответов
+    cursor.execute('''
+        SELECT user_id, score
+        FROM players
+        ORDER BY score DESC
+        LIMIT 10
+    ''')
+    rows = cursor.fetchall()
 
-        if result and result[0] is not None:  # Проверка на None и пустой результат
-            player_grade = result[0]
-            min_difficulty = max(1, int(player_grade - 1))
-            max_difficulty = min(11, int(player_grade + 1))
+    conn.close()
 
-            cursor.execute('''
-                SELECT id, question, correct_answer, options, explanation, link, difficulty
-                FROM questions
-                WHERE subject = ? AND difficulty BETWEEN ? AND ?
-                ORDER BY RANDOM() LIMIT 1
-            ''', (subject_key, min_difficulty, max_difficulty))
-            question_data = cursor.fetchone()
-
-            if question_data:
-                q_id, question, correct_answer, options_str, explanation, link, difficulty = question_data
-                try:
-                    options = json.loads(options_str)
-                except json.JSONDecodeError:
-                    options = options_str.split(',')
-                    options = [opt.strip() for opt in options]
-
-                if correct_answer not in options:
-                    options.append(correct_answer)
-                random.shuffle(options)
-                return {
-                    "id": q_id,
-                    "question": question,
-                    "correct_answer": correct_answer,
-                    "options": options,
-                    "explanation": explanation,
-                    "link": link,
-                    "difficulty": difficulty
-                }
-            else:
-                return None
-        else:
-            # Обработка случая, когда пользователь не найден или grade is NULL
-            logging.warning(f"Не найдена оценка или пользователь {user_id}. Используется значение по умолчанию.")
-            min_difficulty = 4  # Для оценки 5.0
-            max_difficulty = 6  # Для оценки 5.0
-
-            cursor.execute('''
-                SELECT id, question, correct_answer, options, explanation, link, difficulty
-                FROM questions
-                WHERE subject = ? AND difficulty BETWEEN ? AND ?
-                ORDER BY RANDOM() LIMIT 1
-            ''', (subject_key, min_difficulty, max_difficulty))
-            question_data = cursor.fetchone()
-
-            if question_data:
-                q_id, question, correct_answer, options_str, explanation, link, difficulty = question_data
-                try:
-                    options = json.loads(options_str)
-                except json.JSONDecodeError:
-                    options = options_str.split(',')
-                    options = [opt.strip() for opt in options]
-
-                if correct_answer not in options:
-                    options.append(correct_answer)
-                random.shuffle(options)
-                return {
-                    "id": q_id,
-                    "question": question,
-                    "correct_answer": correct_answer,
-                    "options": options,
-                    "explanation": explanation,
-                    "link": link,
-                    "difficulty": difficulty
-                }
-            else:
-                return None
+    return rows
 
 
-    except sqlite3.Error as e:
-        logging.error(f"Ошибка БД в get_question: {e}")
-        return None
-    finally:
-        if conn:
-            conn.close()
-    try:
-        conn = sqlite3.connect('quiz.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT grade FROM players WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-        logging.info(f"Результат запроса для user_id {user_id}: {result}")
+# Функция для получения состояния доски в виде строки
+def get_board_state_3t(board):
+    return "\n".join("".join(board[i]) for i in range(3))
 
-        if result:
-            player_grade = result[0]
-            min_difficulty = max(1, int(player_grade - 1))
-            max_difficulty = min(11, int(player_grade + 1))
 
-            cursor.execute('''
-                SELECT id, question, correct_answer, options, explanation, link, difficulty
-                FROM questions
-                WHERE subject = ? AND difficulty BETWEEN ? AND ?
-                ORDER BY RANDOM() LIMIT 1
-            ''', (subject_key, min_difficulty, max_difficulty))
-            question_data = cursor.fetchone()
+# Функция для проверки, закончилась ли игра
+def is_game_over_3t(board):
+    for player in ["✖️", "⭕"]:
+        if [player] * 3 in board:
+            return player
+        if [player] * 3 in [[board[row][col] for row in range(3)] for col in range(3)]:
+            return player
+        if [player] * 3 in [[board[i][i] for i in range(3)], [board[i][2 - i] for i in range(3)]]:
+            return player
+    if "🔲" not in get_board_state_3t(board):
+        return "🔲"
 
-            if question_data:
-                q_id, question, correct_answer, options_str, explanation, link, difficulty = question_data
-                try:
-                    options = json.loads(options_str)
-                except json.JSONDecodeError:
-                    options = options_str.split(',')
-                    options = [opt.strip() for opt in options]
 
-                if correct_answer not in options:
-                    options.append(correct_answer)
-                random.shuffle(options)
-                return {
-                    "id": q_id,
-                    "question": question,
-                    "correct_answer": correct_answer,
-                    "options": options,
-                    "explanation": explanation,
-                    "link": link,
-                    "difficulty": difficulty
-                }
-            else:
-                return None
-        else:
-            logging.warning(f"Не найдена оценка для пользователя {user_id}. Используется значение по умолчанию.")
-            player_grade = 5.0
-            return get_question(subject_key, user_id)  # Рекурсивный вызов с дефолтной оценкой
+# Функция для отправки сообщения о победе
+def send_win_message_3t(winner, user_id):
+    if winner == "🔲":
+        bot.send_message(user_id, "Все клетки закончились. Ничья!", reply_markup=create_main_keyboard())
+    elif winner == "⭕":
+        bot.send_message(user_id, "Вы выиграли! 🎉 +1 очко!", reply_markup=create_main_keyboard())
+        update_player_stats(user_id, score=1)  # Начисляем 1 очков и увеличиваем счётчик мини-игр
+    else:
+        bot.send_message(user_id, "Бот выиграл! 😢", reply_markup=create_main_keyboard())
+    update_player_stats(user_id, minigames_played=1)  # Увеличиваем счётчик мини-игр в любом случае
 
-    except sqlite3.Error as e:
-        logging.error(f"Ошибка БД в get_question: {e}")
-        return None
-    finally:
-        if conn:
-            conn.close()
+# Функция для получения хода бота
+def get_move_3t(board):
+    available_moves = []
+    for row in range(3):
+        for col in range(3):
+            if board[row][col] == "🔲":
+                available_moves.append((row, col))
+    return choice(available_moves)
 
-# Обновление статистики пользователя
-def update_user_stats(user_id, is_correct):
-    try:
-        conn = sqlite3.connect('quiz.db')
-        cursor = conn.cursor()
-        
-        if is_correct:
-            cursor.execute("UPDATE players SET correct_answers = correct_answers + 1 WHERE user_id = ?", (user_id,))
-        else:
-            cursor.execute("UPDATE players SET incorrect_answers = incorrect_answers + 1 WHERE user_id = ?", (user_id,))
-        
-        # Обновляем оценку пользователя на основе его успехов
-        cursor.execute('''
-            UPDATE players SET grade = 
-            CASE 
-                WHEN (correct_answers + incorrect_answers) = 0 THEN 5.0
-                ELSE 1.0 + 10.0 * correct_answers / (correct_answers + incorrect_answers)
-            END
-            WHERE user_id = ?
-        ''', (user_id,))
-        
-        conn.commit()
-    except sqlite3.Error as e:
-        logging.error(f"Ошибка БД при обновлении статистики: {e}")
-    finally:
-        if conn:
-            conn.close()
 
-# Маршруты Flask
-@app.route('/')
-def index():
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
-    return render_template('index.html')
+# Обработчик команды /start
+@bot.message_handler(commands=["start"])
+def start(msg):
+    # Инициализируем счетчики очков
+    user_id = msg.from_user.id
+    stats = get_player_stats(user_id)
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        
+    with bot.retrieve_data(user_id, msg.chat.id) as data:
+        data["correct_answers"] = stats["correct_answers"]
+        data["incorrect_answers"] = stats["incorrect_answers"]
+
+    bot.send_message(msg.chat.id, "Приветствую в мире знаний! \n Я твой виртуальный помощник, созданный увлечь тебя "
+                                  "захватывающим квизом. Давай проверим твои знания и расширим горизонты вместе! ✨",
+                     reply_markup=create_main_keyboard())
+
+
+# Обработчик команды /score
+@bot.message_handler(commands=["score"])
+def show_score(msg):
+    user_id = msg.from_user.id
+    stats = get_player_stats(user_id)
+
+    # Отправляем статистику пользователю
+    bot.send_message(msg.chat.id, f"📊 Ваша статистика:\n"
+                                  f"✅ Правильных ответов: {stats['correct_answers']}\n"
+                                  f"❌ Неправильных ответов: {stats['incorrect_answers']}\n"
+                                  f"🏆 Очков: {stats['score']}\n"
+                                  f"🎮 Сыграно мини-игр: {stats['minigames_played']}",
+                     reply_markup=create_main_keyboard())
+
+
+# Обработчик команды /leaderboard
+@bot.message_handler(commands=["leaderboard"])
+def show_leaderboard(msg):
+    # Получаем топ игроков
+    leaderboard = get_leaderboard()
+
+    if not leaderboard:
+        bot.send_message(msg.chat.id, "Топ игроков пока пуст. Станьте первым! 🏆",
+                         reply_markup=create_main_keyboard())
+        return
+
+    # Формируем сообщение с топом игроков
+    leaderboard_message = "🏆 Топ игроков:\n"
+    for i, (user_id, correct_answers) in enumerate(leaderboard, start=1):
         try:
-            conn = sqlite3.connect('quiz.db')
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, password FROM players WHERE username = ?", (username,))
-            user = cursor.fetchone()
-            
-            if user and check_password_hash(user[1], password):
-                session['user_id'] = user[0]
-                session['username'] = username
-                flash('Вы успешно вошли в систему!', 'success')
-                return redirect(url_for('dashboard'))
-            else:
-                flash('Неверное имя пользователя или пароль', 'danger')
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка БД при входе: {e}")
-            flash('Произошла ошибка при входе', 'danger')
-        finally:
-            if conn:
-                conn.close()
-    
-    return render_template('login.html')
+            user = bot.get_chat_member(user_id, user_id).user
+            username = user.username if user.username else user.first_name
+        except Exception:
+            username = f"Пользователь {user_id}"
 
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = generate_password_hash(request.form['password'])
-        
-        try:
-            conn = sqlite3.connect('quiz.db')
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO players (username, password) VALUES (?, ?)", (username, password))
-            conn.commit()
-            flash('Регистрация прошла успешно! Теперь вы можете войти.', 'success')
-            return redirect(url_for('login'))
-        except sqlite3.IntegrityError:
-            flash('Это имя пользователя уже занято', 'danger')
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка БД при регистрации: {e}")
-            flash('Произошла ошибка при регистрации', 'danger')
-        finally:
-            if conn:
-                conn.close()
-    
-    return render_template('register.html')
+        leaderboard_message += f"{i}. {username}: {correct_answers} ✅\n"
 
-@app.route('/logout')
-def logout():
-    session.pop('user_id', None)
-    session.pop('username', None)
-    flash('Вы успешно вышли из системы', 'success')
-    return redirect(url_for('index'))
-@app.route('/dashboard')
-def dashboard():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
+    bot.send_message(msg.chat.id, leaderboard_message,
+                     reply_markup=create_main_keyboard())
+
+
+# Обработчик команды /quiz
+@bot.message_handler(commands=["quiz"])
+def start_quiz(msg):
+    user_id = msg.from_user.id
+    bot.set_state(user_id, QuizStates.question, msg.chat.id)
+    ask_question(msg)
+
+
+# Обработчик команды /reset
+@bot.message_handler(commands=["reset"])
+def reset_score(msg):
+    user_id = msg.from_user.id
+
+    # Сбрасываем счетчики очков в базе данных
+    update_player_stats(user_id, -get_player_stats(user_id)["correct_answers"],
+                        -get_player_stats(user_id)["incorrect_answers"])
+
+    # Сбрасываем счетчики очков в состоянии
+    with bot.retrieve_data(user_id, msg.chat.id) as data:
+        data["correct_answers"] = 0
+        data["incorrect_answers"] = 0
+
+    bot.send_message(msg.chat.id, "🔄 Счетчик очков сброшен. Начнем заново!",
+                     reply_markup=create_main_keyboard())
+
+
+@bot.message_handler(commands=["minigame1"])
+def start_tic_tac_toe(message: Message):
+    user_id = message.from_user.id
+
+    # Инициализация игрового поля
+    user_data[user_id] = [["🔲"] * 3 for _ in range(3)]
+
+    # Первый ход бота
+    row, col = get_move_3t(user_data[user_id])
+    user_data[user_id][row][col] = "✖️"
+
+    # Создание клавиатуры для игры
+    cmds_keyboard = create_tic_tac_toe_keyboard()
+
+    # Отправка начального состояния доски
+    bot.send_message(user_id, get_board_state_3t(user_data[user_id]), reply_markup=cmds_keyboard)
+
+    # Установка состояния игры
+    bot.set_state(user_id, "playing_tic_tac_toe", message.chat.id)
+
+
+@bot.message_handler(commands=["minigame2"])
+def start_guess_number(message: Message):
+    user_id = message.from_user.id
+
+    # Загадываем число от 1 до 100
+    secret_number = randint(1, 100)
+    attempts_left = 8  # Количество попыток
+
+    # Сохраняем данные игры в состоянии пользователя
+    with bot.retrieve_data(user_id, message.chat.id) as data:
+        data["secret_number"] = secret_number
+        data["attempts_left"] = attempts_left
+
+    # Отправляем сообщение с правилами игры
+    bot.send_message(user_id, "🎮 Игра 'Угадай число'!\n"
+                              "Я загадал число от 1 до 100. У тебя есть 8 попыток, чтобы угадать его.\n"
+                              "Введи число и попробуй угадать!",
+                     reply_markup=ReplyKeyboardRemove())
+
+    # Устанавливаем состояние игры
+    bot.set_state(user_id, QuizStates.guess_number, message.chat.id)
+
+
+# Функция для задания вопроса
+def ask_question(msg):
+    user_id = msg.from_user.id
+    chat_id = msg.chat.id
+
+    # Получаем случайный вопрос из базы данных
+    question_data = get_random_question()
+    if not question_data:
+        bot.send_message(chat_id, "Вопросы закончились! 🎉",
+                         reply_markup=create_main_keyboard())
+        return
+
+    question = question_data["question"]
+    options = question_data["options"]
+    correct_answer = question_data["correct_answer"]
+
+    # Сохраняем правильный ответ в состоянии пользователя
+    with bot.retrieve_data(user_id, chat_id) as data:
+        data["correct_answer"] = correct_answer
+
+    # Создаем клавиатуру с вариантами ответов
+    markup = create_options_keyboard(options)
+
+    bot.send_message(chat_id, question, reply_markup=markup)
+    bot.set_state(user_id, QuizStates.answer, chat_id)
+
+
+# Обработчик ответа на вопрос
+@bot.message_handler(state=QuizStates.answer)
+def check_answer(msg):
+    user_id = msg.from_user.id
+    chat_id = msg.chat.id
+
+    with bot.retrieve_data(user_id, chat_id) as data:
+        correct_answer = data["correct_answer"]
+
+    if msg.text == correct_answer:
+        # Увеличиваем счетчик правильных ответов и начисляем 1 очко
+        update_player_stats(user_id, correct_answers=1, score=1)  # Добавлено score=1
+        bot.send_message(chat_id, "Правильно! 🎉 +1 очко!", reply_markup=create_main_keyboard())
+    else:
+        # Увеличиваем счетчик неправильных ответов
+        update_player_stats(user_id, incorrect_answers=1)
+        bot.send_message(chat_id, f"Неправильно. Правильный ответ: {correct_answer}",
+                         reply_markup=create_main_keyboard())
+
+    # Задаем следующий вопрос
+    ask_question(msg)
+
+
+@bot.message_handler(func=lambda message: bot.get_state(message.from_user.id, message.chat.id) == "playing_tic_tac_toe")
+def handle_tic_tac_toe_move(message: Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if message.text == "/stop":
+        bot.send_message(user_id, "Игра остановлена. Спасибо за игру!", reply_markup=create_main_keyboard())
+        bot.delete_state(user_id, chat_id)
+        return
 
     try:
-        conn = sqlite3.connect('quiz.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT correct_answers, incorrect_answers, grade FROM players WHERE user_id = ?", (session['user_id'],))
-        stats = cursor.fetchone()
-        print(f"Session: {session}")  # Отладочный вывод - печать всей сессии
-        print(f"Stats from DB: {stats}") # Отладочный вывод - печать результата запроса к БД
+        row, col = map(int, message.text.split())
+        if user_data[user_id][row][col] != "🔲":
+            bot.send_message(user_id, "Невозможный ход. Попробуйте снова.", reply_markup=create_tic_tac_toe_keyboard())
+            return
 
-        if stats:
-            correct, incorrect, grade = stats
-            total = correct + incorrect
-            accuracy = (correct / total * 100) if total > 0 else 0
+        # Ход пользователя
+        user_data[user_id][row][col] = "⭕"
+
+        # Проверка на победу пользователя
+        winner = is_game_over_3t(user_data[user_id])
+        if winner:
+            bot.send_message(user_id, get_board_state_3t(user_data[user_id]))
+            send_win_message_3t(winner, user_id)
+            bot.delete_state(user_id, chat_id)
+            return
+
+        # Ход бота
+        row, col = get_move_3t(user_data[user_id])
+        user_data[user_id][row][col] = "✖️"
+
+        # Проверка на победу бота
+        winner = is_game_over_3t(user_data[user_id])
+        if winner:
+            bot.send_message(user_id, get_board_state_3t(user_data[user_id]))
+            send_win_message_3t(winner, user_id)
+            bot.delete_state(user_id, chat_id)
+            return
+
+        # Отправка обновленного состояния доски
+        bot.send_message(user_id, get_board_state_3t(user_data[user_id]), reply_markup=create_tic_tac_toe_keyboard())
+
+    except Exception as e:
+        print(e)
+        bot.send_message(user_id, "Некорректный ввод. Введите координаты в формате '0 0'.",
+                         reply_markup=create_tic_tac_toe_keyboard())
+
+@bot.message_handler(state=QuizStates.guess_number)
+def handle_guess_number(message: Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    with bot.retrieve_data(user_id, chat_id) as data:
+        secret_number = data["secret_number"]
+        attempts_left = data["attempts_left"]
+
+    try:
+        guess = int(message.text)  # Преобразуем введённое значение в число
+
+        if guess < 1 or guess > 100:
+            bot.send_message(user_id, "Введи число от 1 до 100!")
+            return
+
+        attempts_left -= 1  # Уменьшаем количество оставшихся попыток
+
+        if guess == secret_number:
+            # Пользователь угадал число
+            bot.send_message(user_id, f"🎉 Поздравляю! Ты угадал число {secret_number} за {8 - attempts_left} попыток! +5 очков!",
+                             reply_markup=create_main_keyboard())
+            update_player_stats(user_id, score=5, minigames_played=1)  # Начисляем 5 очков и увеличиваем счётчик мини-игр
+            bot.delete_state(user_id, chat_id)  # Завершаем игру
+            return
+
+        if attempts_left == 0:
+            # Попытки закончились
+            bot.send_message(user_id, f"😢 К сожалению, попытки закончились. Я загадал число {secret_number}.",
+                             reply_markup=create_main_keyboard())
+            update_player_stats(user_id, minigames_played=1)  # Увеличиваем счётчик мини-игр
+            bot.delete_state(user_id, chat_id)  # Завершаем игру
+            return
+
+        # Подсказка пользователю
+        if guess < secret_number:
+            bot.send_message(user_id, f"⬆️ Загаданное число больше. Осталось попыток: {attempts_left}")
         else:
-            # Здесь обрабатываем случай, когда пользователь не найден
-            correct = incorrect = total = accuracy = 0
-            grade = 5.0  # Или другое значение по умолчанию
+            bot.send_message(user_id, f"⬇️ Загаданное число меньше. Осталось попыток: {attempts_left}")
 
-        # Округляем grade только если он не None.  Если None, используем значение по умолчанию
-        grade = round(grade, 1) if grade is not None else 5.0
+        # Обновляем количество оставшихся попыток в состоянии
+        with bot.retrieve_data(user_id, chat_id) as data:
+            data["attempts_left"] = attempts_left
 
-    except sqlite3.Error as e:
-        logging.error(f"Ошибка БД в dashboard: {e}")
-        flash('Ошибка загрузки статистики', 'danger')
-        return redirect(url_for('index'))  # Redirect to index in case of error
-    finally:
-        if conn:
-            conn.close()
-
-    return render_template('dashboard.html',
-                         username=session.get('username'),  # Use .get to avoid KeyError if username is missing
-                         correct=correct,
-                         incorrect=incorrect,
-                         total=total,
-                         accuracy=round(accuracy, 1),
-                         grade=grade,  # Already rounded
-                         subjects=get_subjects())
+    except ValueError:
+        # Если пользователь ввёл не число
+        bot.send_message(user_id, "Пожалуйста, введи число от 1 до 100.")
+        return  # Прерываем выполнение функции, чтобы не уменьшать attempts_left
 
 
-@app.route('/quiz/<subject>', methods=['GET', 'POST'])
-def quiz(subject):
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-
-    subject_key = SUBJECT_MAP.get(subject)
-    if not subject_key:
-        flash('Неверный предмет', 'danger')
-        return redirect(url_for('dashboard'))
-
-    if request.method == 'POST':
-        # ... (обработка ответа пользователя)
-        # ... (flash messages о правильности ответа)
-        pass  #  Не делаем redirect после ответа
-
-    question = get_question(subject_key, session['user_id'])
-
-    if not question:  # Если вопросов нет, только тогда делаем redirect
-        flash('Вопросы по этому предмету закончились. Попробуйте позже.', 'warning')
-        return redirect(url_for('dashboard'))
-
-    return render_template('quiz.html',
-                         subject=subject,
-                         question=question['question'],
-                         question_id=question['id'],
-                         options=question['options'])
+# Обработчик неизвестных команд
+@bot.message_handler(func=lambda message: True)
+def error_message(message):
+    bot.send_message(message.from_user.id, "Я вас не понял🤷‍♀️",
+                     reply_markup=create_main_keyboard())
 
 
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    
-    subject_key = SUBJECT_MAP.get(subject)
-    if not subject_key:
-        flash('Неверный предмет', 'danger')
-        return redirect(url_for('dashboard'))
-    
-    if request.method == 'POST':
-        # Обработка ответа пользователя
-        question_id = request.form.get('question_id')
-        user_answer = request.form.get('answer')
-        
-        try:
-            conn = sqlite3.connect('quiz.db')
-            cursor = conn.cursor()
-            cursor.execute("SELECT correct_answer, explanation, link FROM questions WHERE id = ?", (question_id,))
-            question_data = cursor.fetchone()
-            
-            if question_data:
-                correct_answer, explanation, link = question_data
-                is_correct = (user_answer == correct_answer)
-                update_user_stats(session['user_id'], is_correct)
-                
-                flash('✅ Правильно!' if is_correct else f'❌ Неправильно! Правильный ответ: {correct_answer}', 
-                      'success' if is_correct else 'danger')
-                
-                if explanation:
-                    flash(f'🤓 Пояснение: {explanation}', 'info')
-                if link:
-                    flash(f'🔗 Дополнительный материал: {link}', 'info')
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка БД при проверке ответа: {e}")
-            flash('Ошибка при проверке ответа', 'danger')
-        finally:
-            if conn:
-                conn.close()
-    
-    # Получаем новый вопрос
-    question = get_question(subject_key, session['user_id'])
-    if not question:
-        flash('Вопросы по этому предмету закончились. Попробуйте позже.', 'warning')
-        return redirect(url_for('dashboard'))
-    
-    return render_template('quiz.html', 
-                         subject=subject,
-                         question=question['question'],
-                         question_id=question['id'],
-                         options=question['options'])
+# Регистрируем фильтр состояний
+bot.add_custom_filter(custom_filters.StateFilter(bot))
 
-@app.route('/help')
-def help():
-    return render_template('help.html')
-
-if __name__ == '__main__':
-    init_db()
-    app.run(debug=True)
+# Запуск бота
+bot.infinity_polling()
